@@ -1,0 +1,33 @@
+{
+	"name": "neonmaps-search-location",
+	"version": "0.1.0",
+	"author": {
+		"name": "Aritz Beobide-Cardinal",
+		"email": "aritz@aritzcracker.ca"
+	},
+	"license": "CC-BY-NC-SA-4.0",
+	"main": "index.js",
+	"bin": {
+		"neonmaps-search-indexer": "./bin/neonmaps-search-indexer.js"
+	},
+	"dependencies": {
+		"@turf/bbox": "^6.3.0",
+		"@turf/bbox-polygon": "^6.3.0",
+		"@turf/boolean-contains": "^6.3.0",
+		"@turf/boolean-intersects": "^6.3.0",
+		"@turf/centroid": "^6.3.0",
+		"@turf/helpers": "^6.3.0",
+		"binary-search-bounds": "^2.0.5",
+		"commander": "^7.2.0",
+		"neonmaps-base": "^0.2.4",
+		"pbf": "^3.2.1",
+		"protocol-buffers-schema": "^3.5.1"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/norstone-tech/neonmaps-search-location"
+	},
+	"bugs": {
+		"url": "https://github.com/norstone-tech/neonmaps-search-location/issues"
+	}
+}

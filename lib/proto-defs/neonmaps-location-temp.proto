@@ -1,0 +1,12 @@
+syntax = "proto2";
+message TempFile {
+	enum MemberType {
+		NODE = 0;
+		WAY = 1;
+		RELATION = 2;
+	}
+	repeated uint64 id = 1 [packed = true];
+	repeated MemberType type = 2 [packed = true];
+	repeated sint32 lon = 3 [packed = true];
+	repeated sint32 lat = 4 [packed = true];
+}
