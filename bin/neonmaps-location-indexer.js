@@ -100,6 +100,9 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 			const things = [...mapData.ways, ...mapData.relations];
 			for(let i = 0; i < things.length; i += 1){
 				const thing = things[i];
+				if(thing.tags.size == 0){
+					continue;
+				}
 				const geometry = thing.type == "way" ?
 					await mapReader.getWayGeoJSON(thing) :
 					await mapReader.getRelationGeoJSON(thing);
@@ -118,7 +121,7 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 				const granularityMaxLon = Math.floor(bbox[2] / granularityDivisor);
 				const granularityMaxLat = Math.floor(bbox[3] / granularityDivisor);
 				/* These for loops are needed in case this element is actually intersecting with multiple granularity
-				   indexes */
+				   indexes. This also conveniently skips over any elements with invalid geometry */
 				for(
 					let granularityLon = granularityMinLon;
 					granularityLon <= granularityMaxLon;
@@ -142,7 +145,7 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 							index += bounds.ge(latSubarray, granularityLat);
 						}
 						tmpData.id.splice(index, 0, thing.id);
-						tmpData.type.splice(index, 0, 0);
+						tmpData.type.splice(index, 0, thing.type == "way" ? 1 : 2);
 						tmpData.lon.splice(index, 0, granularityLon);
 						tmpData.lat.splice(index, 0, granularityLat);
 					}
