@@ -1,0 +1,19 @@
+syntax = "proto2";
+message SearchSquareMember {
+	enum MemberType {
+		NODE = 0;
+		WAY = 1;
+		RELATION = 2;
+	}
+	repeated uint64 id = 1 [packed = true]; // DELTA coded
+	repeated MemberType type = 2 [packed = true];
+	repeated sint64 lonMin = 3 [packed = true]; // nanodegrees DELTA coded (Starting at square)
+	repeated sint64 latMin = 4 [packed = true]; // nanodegrees DELTA coded (Starting at square)
+	repeated sint64 lonMax = 5 [packed = true]; // nanodegrees DELTA coded (Starting at square)
+	repeated sint64 latMax = 6 [packed = true]; // nanodegrees DELTA coded (Starting at square)
+}
+message SearchSquare {
+	optional SearchSquareMember within = 1;
+	optional SearchSquareMember intersected = 2;
+	optional SearchSquareMember enveloped = 3; // Only possible at the highest granularity
+}

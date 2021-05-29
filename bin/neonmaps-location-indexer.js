@@ -10,16 +10,27 @@ const {program} = require("commander");
 const {MapReader} = require("neonmaps-base");
 const bounds = require("binary-search-bounds");
 const {default: geoBBox} = require("@turf/bbox");
+const {default: geoBBoxPoly} = require("@turf/bbox-polygon");
+const {default: geoContains, doBBoxOverlap: geoBBoxContains} = require("@turf/boolean-contains");
+const {default: geoIntersects} = require("@turf/boolean-intersects");
 const {logProgressMsg} = require("../lib/util");
 const {setTempFileDir, getTempFile, flushTempFiles} = require("../lib/indexer/tmpfiles");
+const {SearchSquare: SearchSquareParser} = require("../lib/proto-defs");
+const Pbf = require("pbf");
 
 /**@typedef {import("neonmaps-base/lib/map-reader-base").OSMDecodeResult} OSMDecodeResult */
+/**@typedef {import("../lib/proto-defs").ProtoSearchSquare} ProtoSearchSquare */
+/**@typedef {import("../lib/proto-defs").ProtoSearchSquareMember} ProtoSearchSquareMember */
 const MIN_INDEX_GRANULARITY = -2;
 const MAX_INDEX_GRANULARITY = 1;
 const NANO_EXPONENT = 9;
 const NANO_DIVISOR = 10**9;
 const SIZE_BBOX_RATIO = 5; // Element bbox must be this times smaller than the containing granularity index
 const INT48_SIZE = 6;
+const INT32_SIZE = 4;
+const OSMTYPE_NODE = 0;
+const OSMTYPE_WAY = 1;
+const OSMTYPE_RELATION = 2;
 const options = program
 	.requiredOption("-m, --map <path>", "Map file, in .osm.pbf format")
 	.option(
@@ -28,7 +39,14 @@ const options = program
 	)
 	.parse()
 	.opts();
-
+const writeAndWait = function(
+	/**@type {fs.WriteStream}*/ stream,
+	/**@type {Buffer}*/ data
+){
+	if(!stream.write(data)){
+		return new Promise(resolve => stream.on("drain", resolve));
+	}
+}
 const mapPath = path.resolve(options.map);
 const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 (async () => {
@@ -141,7 +159,7 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 						const lastIndex = firstIndex >= tmpData.lon.length ? -1 : bounds.le(tmpData.lon, granularityLon);
 						let index = firstIndex;
 						if(firstIndex < tmpData.lon.length){
-							const latSubarray = tmpData.lat.slice(firstIndex, lastIndex);
+							const latSubarray = tmpData.lat.slice(firstIndex, lastIndex + 1);
 							index += bounds.ge(latSubarray, granularityLat);
 						}
 						tmpData.id.splice(index, 0, thing.id);
@@ -165,6 +183,186 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 			" (100%)"
 		);
 		await flushTempFiles(0);
+		for(let exponent = MIN_INDEX_GRANULARITY; exponent <= MAX_INDEX_GRANULARITY; exponent += 1){
+			const tmpFileOffsets = fs.createWriteStream(tmpDir + "/" + exponent + "_offsets");
+			const tmpFileProtoBufs = fs.createWriteStream(tmpDir + "/" + exponent + "_offsets");
+			let currentOffset = 0;
+
+			const granularityDivisor = 10 ** exponent;
+			const maxLon = 180 / granularityDivisor;
+			const maxLat = 90 / granularityDivisor;
+			for(let granularityLon = -180 / granularityDivisor; granularityLon < maxLon; granularityLon += 1){
+				const uGranularityLon = granularityLon + (180 / granularityDivisor);
+				for(let granularityLat = -90 / granularityDivisor; granularityLat < maxLat; granularityLat += 1){
+					const uGranularityLat = granularityLat + (90 / granularityDivisor);
+					const tmpData = await getTempFile(
+						Math.floor(granularityLon * granularityDivisor),
+						Math.floor(granularityLat * granularityDivisor),
+						exponent
+					);
+					if(!tmpData.id.length){
+						continue;
+					}
+					/**@type {number} */
+					const firstLonIndex = bounds.ge(tmpData.lon, granularityLon);
+					if(tmpData.lon[firstLonIndex] != granularityLon){
+						continue;
+					}
+					/**@type {number} */
+					const lastLonIndex = bounds.le(tmpData.lon, granularityLon) + 1;
+					const latSubarray = tmpData.lat.slice(firstLonIndex, lastLonIndex);
+					/**@type {number} */
+					const firstLatIndex = bounds.ge(latSubarray, granularityLat);
+					if(tmpData.lat[firstLatIndex] != granularityLat){
+						continue;
+					}
+					/**@type {number} */
+					const lastLatIndex = bounds.le(latSubarray, granularityLat) + 1;
+					const firstIndex = firstLonIndex + firstLatIndex;
+					const lastIndex = firstLonIndex + lastLatIndex;
+					const firstLon = granularityLon * 10 ** (NANO_EXPONENT + exponent);
+					const firstLat = granularityLat * 10 ** (NANO_EXPONENT + exponent);
+					const searchBBoxPoly = geoBBoxPoly([
+						firstLon,
+						firstLat,
+						(granularityLon + 1) * 10 ** (NANO_EXPONENT + exponent),
+						(granularityLat + 1) * 10 ** (NANO_EXPONENT + exponent)
+					]);
+					const searchData = {
+						within: {
+							_lastID: 0,
+							_lastLonMin: firstLon,
+							_lastLatMin: firstLat,
+							_lastLonMax: firstLon,
+							_lastLatMax: firstLat,
+							id: [],
+							type: [],
+							lonMin: [],
+							latMin: [],
+							lonMax: [],
+							latMax: []
+						},
+						intersected: {
+							_lastID: 0,
+							_lastLonMin: firstLon,
+							_lastLatMin: firstLat,
+							_lastLonMax: firstLon,
+							_lastLatMax: firstLat,
+							id: [],
+							type: [],
+							lonMin: [],
+							latMin: [],
+							lonMax: [],
+							latMax: []
+						},
+						enveloped: {
+							_lastID: 0,
+							_lastLonMin: firstLon,
+							_lastLatMin: firstLat,
+							_lastLonMax: firstLon,
+							_lastLatMax: firstLat,
+							id: [],
+							type: [],
+							lonMin: [],
+							latMin: [],
+							lonMax: [],
+							latMax: []
+						},
+					}
+					const subArrID = tmpData.id.slice(firstIndex, lastIndex);
+					const subArrType = tmpData.type.slice(firstIndex, lastIndex);
+					/*
+					const subArrLon = tmpData.lon.slice(firstIndex, lastIndex);
+					const subArrLat = tmpData.lon.slice(firstIndex, lastIndex);
+					*/
+					for(let i = 0; i < subArrID.length; i += 1){
+						const id = subArrID[i];
+						const type = subArrType[i];
+						if(type == OSMTYPE_NODE){
+							// Points are always fully within the square
+							const node = await mapReader.getNode(id);
+							const nanoLon = Math.round(node.lon * NANO_DIVISOR);
+							const nanoLat = Math.round(node.lat * NANO_DIVISOR);
+							const {within} = searchData;
+							within.id.push(id - within._lastID);
+							within._lastID = id;
+							within.type.push(type);
+							within.lonMin.push(nanoLon - within._lastLonMin);
+							within._lastLonMin = nanoLon;
+							within.lanMin.push(nanoLat - within._lastLatMin);
+							within._lastLatMin = nanoLat;
+							within.lonMax.push(nanoLon - within._lastLonMax);
+							within._lastLonMax = nanoLon;
+							within.lanMax.push(nanoLat - within._lastLatMax);
+							within._lastLatMax = nanoLat;
+							continue;
+						}
+						const osmElem = type == OSMTYPE_WAY ?
+							await mapReader.getWay(id) :
+							await mapReader.getRelation(id);
+						const osmPoly = type == OSMTYPE_WAY ?
+							await mapReader.getWayGeoJSON(osmElem) :
+							await mapReader.getRelationGeoJSON(osmElem);
+						osmPoly.bbox = geoBBox(osmPoly);
+						const searchMember = geoBBoxContains(searchBBoxPoly.bbox, osmPoly.bbox) ?
+							searchData.within : (
+								geoIntersects(searchBBoxPoly, osmPoly) ?
+									searchData.intersected : (
+										geoContains(osmPoly, searchBBoxPoly) ? searchData.enveloped : null
+									)
+							);
+						if(searchMember == null){
+							// Bounding box may have overlapped, but the shape itself doesn't in any way
+							continue;
+						}
+						const nanoMinLon = Math.round(osmPoly.bbox[0] * NANO_DIVISOR);
+						const nanoMinLat = Math.round(osmPoly.bbox[1] * NANO_DIVISOR);
+						const nanoMaxLon = Math.round(osmPoly.bbox[2] * NANO_DIVISOR);
+						const nanoMaxLat = Math.round(osmPoly.bbox[3] * NANO_DIVISOR);
+						searchMember.id.push(id - searchMember._lastID);
+						searchMember._lastID = id;
+						searchMember.type.push(type);
+						searchMember.lonMin.push(nanoMinLon - searchMember._lastLonMin);
+						searchMember._lastLonMin = nanoMinLon;
+						searchMember.lanMin.push(nanoMinLat - searchMember._lastLatMin);
+						searchMember._lastLatMin = nanoMinLat;
+						searchMember.lonMax.push(nanoMaxLon - searchMember._lastLonMax);
+						searchMember._lastLonMax = nanoMaxLon;
+						searchMember.lanMax.push(nanoMaxLat - searchMember._lastLatMax);
+						searchMember._lastLatMax = nanoMaxLat;
+					}
+					if(searchData.within._lastID == 0){
+						delete searchData.within;
+					}
+					if(searchData.intersected._lastID == 0){
+						delete searchData.intersected;
+					}
+					if(searchData.enveloped._lastID == 0){
+						delete searchData.enveloped;
+					}
+					const searchPbf = new Pbf();
+					SearchSquareParser.write(searchData, searchPbf);
+					const searchBuf = searchPbf.finish();
+					const indexBuf = Buffer.allocUnsafe(INT32_SIZE * 3);
+					indexBuf.writeUInt32LE(uGranularityLon * 10 ** (-(exponent + 2)) + uGranularityLat);
+					indexBuf.writeUInt32LE(currentOffset, INT32_SIZE);
+					indexBuf.writeUInt32LE(searchBuf.length, INT32_SIZE * 2);
+					currentOffset += searchBuf.length;
+					await Promise.all([
+						writeAndWait(tmpFileOffsets, indexBuf),
+						writeAndWait(tmpFileProtoBufs, searchBuf)
+					]);
+				}
+				logProgressMsg(
+					"Index assembly part1 for 10**(" + exponent + "): " +
+						(uGranularityLon) + "/ 360" +
+					" (" +
+					(uGranularityLon / 360 * 100).toFixed(2) +
+					"%)"
+				);
+			}
+			console.log("Index assembly part1 for 10**(" + exponent + "): 360/360 (100%)");
+		}
 	}catch(ex){
 		console.error(ex);
 		process.exitCode = 1;
