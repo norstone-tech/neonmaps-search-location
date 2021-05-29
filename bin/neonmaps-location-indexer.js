@@ -37,6 +37,8 @@ const options = program
 		"--no-ignore-tagless",
 		"Tag-less elements are ignored by default as they are assumed to be part of other geometry"
 	)
+	.option("--tmpdir <dir>", "(debug) temp folder to use during indexing")
+	.option("--no-phase1", "(debug) skip phase 1")
 	.parse()
 	.opts();
 const writeAndWait = function(
@@ -50,139 +52,143 @@ const writeAndWait = function(
 const mapPath = path.resolve(options.map);
 const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 (async () => {
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "neonmaps-location-"));
+	const tmpDir = options.tmpdir ?
+		path.resolve(options.tmpdir) :
+		await fsp.mkdtemp(path.join(os.tmpdir(), "neonmaps-location-"));
 	try{
 		setTempFileDir(tmpDir);
 		await mapReader.init();
-		/**@type {Promise<number>} */
-		let offsetPromise;
-		/**@type {Promise<OSMDecodeResult>} */
-		let mapDataPromise;
-		let curentSegment = 0;
-		let segmentCount = 0;
-		let firstSegmentWithWay = 0;
-		for(offsetPromise of mapReader.offsets()){
-			await offsetPromise;
-			segmentCount += 1;
-		}
-		for(mapDataPromise of mapReader.mapSegments()){
-			const mapData = await mapDataPromise;
-			if(!firstSegmentWithWay && mapData.ways.length){
-				firstSegmentWithWay = curentSegment;
+		if(options.phase1){
+			/**@type {Promise<number>} */
+			let offsetPromise;
+			/**@type {Promise<OSMDecodeResult>} */
+			let mapDataPromise;
+			let curentSegment = 0;
+			let segmentCount = 0;
+			let firstSegmentWithWay = 0;
+			for(offsetPromise of mapReader.offsets()){
+				await offsetPromise;
+				segmentCount += 1;
 			}
-			if(!mapData.nodes.length){
-				break;
+			for(mapDataPromise of mapReader.mapSegments()){
+				const mapData = await mapDataPromise;
+				if(!firstSegmentWithWay && mapData.ways.length){
+					firstSegmentWithWay = curentSegment;
+				}
+				if(!mapData.nodes.length){
+					break;
+				}
+				for(let i = 0; i < mapData.nodes.length; i += 1){
+					const node = mapData.nodes[i];
+					if(options.ignoreTagless && node.tags.size == 0){
+						continue;
+					}
+					const granularityDivisor = 10 ** MIN_INDEX_GRANULARITY;
+					const baseLon = Math.floor(node.lon);
+					const baseLat = Math.floor(node.lat);
+					const granularityLon = Math.floor(node.lon / granularityDivisor);
+					const granularityLat = Math.floor(node.lat / granularityDivisor);
+					const tmpData = await getTempFile(baseLon, baseLat, MIN_INDEX_GRANULARITY);
+					/**@type {number} */
+					const firstIndex = bounds.ge(tmpData.lon, granularityLon);
+					/**@type {number} */
+					const lastIndex = firstIndex >= tmpData.lon.length ? -1 : bounds.le(tmpData.lon, granularityLon);
+					let index = firstIndex;
+					if(firstIndex < tmpData.lon.length){
+						const latSubarray = tmpData.lat.slice(firstIndex, lastIndex);
+						index += bounds.ge(latSubarray, granularityLat);
+					}
+					tmpData.id.splice(index, 0, node.id);
+					tmpData.type.splice(index, 0, 0);
+					tmpData.lon.splice(index, 0, granularityLon);
+					tmpData.lat.splice(index, 0, granularityLat);
+				}
+				curentSegment += 1;
+				logProgressMsg(
+					"Node indexing: " + curentSegment + "/" + segmentCount + " (" +
+					(curentSegment / segmentCount * 100).toFixed(2) +
+					"%)"
+				);
 			}
-			for(let i = 0; i < mapData.nodes.length; i += 1){
-				const node = mapData.nodes[i];
-				if(options.ignoreTagless && node.tags.size == 0){
+			console.log("Node indexing: " + segmentCount + "/" + segmentCount + " (100%)");
+			curentSegment = 0;
+			
+			for(offsetPromise of mapReader.offsets()){
+				const offset = await offsetPromise;
+				curentSegment += 1;
+				if(curentSegment < firstSegmentWithWay){
 					continue;
 				}
-				const granularityDivisor = 10 ** MIN_INDEX_GRANULARITY;
-				const baseLon = Math.floor(node.lon);
-				const baseLat = Math.floor(node.lat);
-				const granularityLon = Math.floor(node.lon / granularityDivisor);
-				const granularityLat = Math.floor(node.lat / granularityDivisor);
-				const tmpData = await getTempFile(baseLon, baseLat, MIN_INDEX_GRANULARITY);
-				/**@type {number} */
-				const firstIndex = bounds.ge(tmpData.lon, granularityLon);
-				/**@type {number} */
-				const lastIndex = firstIndex >= tmpData.lon.length ? -1 : bounds.le(tmpData.lon, granularityLon);
-				let index = firstIndex;
-				if(firstIndex < tmpData.lon.length){
-					const latSubarray = tmpData.lat.slice(firstIndex, lastIndex);
-					index += bounds.ge(latSubarray, granularityLat);
-				}
-				tmpData.id.splice(index, 0, node.id);
-				tmpData.type.splice(index, 0, 0);
-				tmpData.lon.splice(index, 0, granularityLon);
-				tmpData.lat.splice(index, 0, granularityLat);
-			}
-			curentSegment += 1;
-			logProgressMsg(
-				"Node indexing: " + curentSegment + "/" + segmentCount + " (" +
-				(curentSegment / segmentCount * 100).toFixed(2) +
-				"%)"
-			);
-		}
-		console.log("Node indexing: " + segmentCount + "/" + segmentCount + " (100%)");
-		curentSegment = 0;
-		
-		for(offsetPromise of mapReader.offsets()){
-			const offset = await offsetPromise;
-			curentSegment += 1;
-			if(curentSegment < firstSegmentWithWay){
-				continue;
-			}
-			const mapData = await mapReader.readDecodedMapSegment(offset);
-			const things = [...mapData.ways, ...mapData.relations];
-			for(let i = 0; i < things.length; i += 1){
-				const thing = things[i];
-				if(thing.tags.size == 0){
-					continue;
-				}
-				const geometry = thing.type == "way" ?
-					await mapReader.getWayGeoJSON(thing) :
-					await mapReader.getRelationGeoJSON(thing);
-				const bbox = geoBBox(geometry);
-				// Math.abs is probably redundant here, but just to be
-				const bbSize = Math.max(Math.abs(bbox[0] - bbox[2]), Math.abs(bbox[1] - bbox[3]));
-				let exponent = Math.floor(Math.log10(bbSize * SIZE_BBOX_RATIO)) + 1;
-				if(exponent < MIN_INDEX_GRANULARITY){
-					exponent = MIN_INDEX_GRANULARITY;
-				}else if(exponent > MAX_INDEX_GRANULARITY){
-					exponent = MAX_INDEX_GRANULARITY;
-				}
-				const granularityDivisor = 10 ** exponent;
-				const granularityMinLon = Math.floor(bbox[0] / granularityDivisor);
-				const granularityMinLat = Math.floor(bbox[1] / granularityDivisor);
-				const granularityMaxLon = Math.floor(bbox[2] / granularityDivisor);
-				const granularityMaxLat = Math.floor(bbox[3] / granularityDivisor);
-				/* These for loops are needed in case this element is actually intersecting with multiple granularity
-				   indexes. This also conveniently skips over any elements with invalid geometry */
-				for(
-					let granularityLon = granularityMinLon;
-					granularityLon <= granularityMaxLon;
-					granularityLon += 1
-				){
+				const mapData = await mapReader.readDecodedMapSegment(offset);
+				const things = [...mapData.ways, ...mapData.relations];
+				for(let i = 0; i < things.length; i += 1){
+					const thing = things[i];
+					if(thing.tags.size == 0){
+						continue;
+					}
+					const geometry = thing.type == "way" ?
+						await mapReader.getWayGeoJSON(thing) :
+						await mapReader.getRelationGeoJSON(thing);
+					const bbox = geoBBox(geometry);
+					// Math.abs is probably redundant here, but just to be
+					const bbSize = Math.max(Math.abs(bbox[0] - bbox[2]), Math.abs(bbox[1] - bbox[3]));
+					let exponent = Math.floor(Math.log10(bbSize * SIZE_BBOX_RATIO)) + 1;
+					if(exponent < MIN_INDEX_GRANULARITY){
+						exponent = MIN_INDEX_GRANULARITY;
+					}else if(exponent > MAX_INDEX_GRANULARITY){
+						exponent = MAX_INDEX_GRANULARITY;
+					}
+					const granularityDivisor = 10 ** exponent;
+					const granularityMinLon = Math.floor(bbox[0] / granularityDivisor);
+					const granularityMinLat = Math.floor(bbox[1] / granularityDivisor);
+					const granularityMaxLon = Math.floor(bbox[2] / granularityDivisor);
+					const granularityMaxLat = Math.floor(bbox[3] / granularityDivisor);
+					/* These for loops are needed in case this element is actually intersecting with multiple granularity
+					indexes. This also conveniently skips over any elements with invalid geometry */
 					for(
-						let granularityLat = granularityMinLat;
-						granularityLat <= granularityMaxLat;
-						granularityLat += 1
+						let granularityLon = granularityMinLon;
+						granularityLon <= granularityMaxLon;
+						granularityLon += 1
 					){
-						const baseLon = Math.floor(granularityLon * granularityDivisor);
-						const baseLat = Math.floor(granularityLat * granularityDivisor);
-						const tmpData = await getTempFile(baseLon, baseLat, exponent);
-						/**@type {number} */
-						const firstIndex = bounds.ge(tmpData.lon, granularityLon);
-						/**@type {number} */
-						const lastIndex = firstIndex >= tmpData.lon.length ? -1 : bounds.le(tmpData.lon, granularityLon);
-						let index = firstIndex;
-						if(firstIndex < tmpData.lon.length){
-							const latSubarray = tmpData.lat.slice(firstIndex, lastIndex + 1);
-							index += bounds.ge(latSubarray, granularityLat);
+						for(
+							let granularityLat = granularityMinLat;
+							granularityLat <= granularityMaxLat;
+							granularityLat += 1
+						){
+							const baseLon = Math.floor(granularityLon * granularityDivisor);
+							const baseLat = Math.floor(granularityLat * granularityDivisor);
+							const tmpData = await getTempFile(baseLon, baseLat, exponent);
+							/**@type {number} */
+							const firstIndex = bounds.ge(tmpData.lon, granularityLon);
+							/**@type {number} */
+							const lastIndex = firstIndex >= tmpData.lon.length ? -1 : bounds.le(tmpData.lon, granularityLon);
+							let index = firstIndex;
+							if(firstIndex < tmpData.lon.length){
+								const latSubarray = tmpData.lat.slice(firstIndex, lastIndex + 1);
+								index += bounds.ge(latSubarray, granularityLat);
+							}
+							tmpData.id.splice(index, 0, thing.id);
+							tmpData.type.splice(index, 0, thing.type == "way" ? 1 : 2);
+							tmpData.lon.splice(index, 0, granularityLon);
+							tmpData.lat.splice(index, 0, granularityLat);
 						}
-						tmpData.id.splice(index, 0, thing.id);
-						tmpData.type.splice(index, 0, thing.type == "way" ? 1 : 2);
-						tmpData.lon.splice(index, 0, granularityLon);
-						tmpData.lat.splice(index, 0, granularityLat);
 					}
 				}
+				logProgressMsg(
+					"way/relation indexing: " +
+						(curentSegment - firstSegmentWithWay) + "/" + (segmentCount - firstSegmentWithWay) +
+					" (" +
+					((curentSegment - firstSegmentWithWay) / (segmentCount - firstSegmentWithWay) * 100).toFixed(2) +
+					"%)"
+				);
 			}
-			logProgressMsg(
+			console.log(
 				"way/relation indexing: " +
-					(curentSegment - firstSegmentWithWay) + "/" + (segmentCount - firstSegmentWithWay) +
-				" (" +
-				((curentSegment - firstSegmentWithWay) / (segmentCount - firstSegmentWithWay) * 100).toFixed(2) +
-				"%)"
+				(segmentCount - firstSegmentWithWay) + "/" + (segmentCount - firstSegmentWithWay) +
+				" (100%)"
 			);
+			await flushTempFiles(0);
 		}
-		console.log(
-			"way/relation indexing: " +
-			(segmentCount - firstSegmentWithWay) + "/" + (segmentCount - firstSegmentWithWay) +
-			" (100%)"
-		);
-		await flushTempFiles(0);
 		for(let exponent = MIN_INDEX_GRANULARITY; exponent <= MAX_INDEX_GRANULARITY; exponent += 1){
 			const tmpFileOffsets = fs.createWriteStream(tmpDir + "/" + exponent + "_offsets");
 			const tmpFileProtoBufs = fs.createWriteStream(tmpDir + "/" + exponent + "_offsets");
