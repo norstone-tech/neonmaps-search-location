@@ -191,7 +191,7 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 		}
 		for(let exponent = MIN_INDEX_GRANULARITY; exponent <= MAX_INDEX_GRANULARITY; exponent += 1){
 			const tmpFileOffsets = fs.createWriteStream(tmpDir + "/" + exponent + "_offsets");
-			const tmpFileProtoBufs = fs.createWriteStream(tmpDir + "/" + exponent + "_offsets");
+			const tmpFileProtoBufs = fs.createWriteStream(tmpDir + "/" + exponent + "_pbfs");
 			let currentOffset = 0;
 
 			const granularityDivisor = 10 ** exponent;
@@ -199,6 +199,7 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 			const maxLat = 90 / granularityDivisor;
 			for(let granularityLon = -180 / granularityDivisor; granularityLon < maxLon; granularityLon += 1){
 				const uGranularityLon = granularityLon + (180 / granularityDivisor);
+				let allNonexistant = true;
 				for(let granularityLat = -90 / granularityDivisor; granularityLat < maxLat; granularityLat += 1){
 					const uGranularityLat = granularityLat + (90 / granularityDivisor);
 					const tmpData = await getTempFile(
@@ -207,19 +208,23 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 						exponent
 					);
 					if(!tmpData.id.length){
+						granularityLat = (
+							(Math.floor(granularityLat * granularityDivisor) + 1
+						) / granularityDivisor) - 1;
 						continue;
 					}
+					allNonexistant = false;
 					/**@type {number} */
 					const firstLonIndex = bounds.ge(tmpData.lon, granularityLon);
 					if(tmpData.lon[firstLonIndex] != granularityLon){
-						continue;
+						break;
 					}
 					/**@type {number} */
 					const lastLonIndex = bounds.le(tmpData.lon, granularityLon) + 1;
 					const latSubarray = tmpData.lat.slice(firstLonIndex, lastLonIndex);
 					/**@type {number} */
 					const firstLatIndex = bounds.ge(latSubarray, granularityLat);
-					if(tmpData.lat[firstLatIndex] != granularityLat){
+					if(latSubarray[firstLatIndex] != granularityLat){
 						continue;
 					}
 					/**@type {number} */
@@ -229,10 +234,10 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 					const firstLon = granularityLon * 10 ** (NANO_EXPONENT + exponent);
 					const firstLat = granularityLat * 10 ** (NANO_EXPONENT + exponent);
 					const searchBBoxPoly = geoBBoxPoly([
-						firstLon,
-						firstLat,
-						(granularityLon + 1) * 10 ** (NANO_EXPONENT + exponent),
-						(granularityLat + 1) * 10 ** (NANO_EXPONENT + exponent)
+						Number((firstLon / NANO_DIVISOR).toFixed(9)),
+						Number((firstLat / NANO_DIVISOR).toFixed(9)),
+						Number((((granularityLon + 1) * 10 ** (NANO_EXPONENT + exponent)) / NANO_DIVISOR).toFixed(9)),
+						Number((((granularityLat + 1) * 10 ** (NANO_EXPONENT + exponent)) / NANO_DIVISOR).toFixed(9))
 					]);
 					const searchData = {
 						within: {
@@ -295,11 +300,11 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 							within.type.push(type);
 							within.lonMin.push(nanoLon - within._lastLonMin);
 							within._lastLonMin = nanoLon;
-							within.lanMin.push(nanoLat - within._lastLatMin);
+							within.latMin.push(nanoLat - within._lastLatMin);
 							within._lastLatMin = nanoLat;
 							within.lonMax.push(nanoLon - within._lastLonMax);
 							within._lastLonMax = nanoLon;
-							within.lanMax.push(nanoLat - within._lastLatMax);
+							within.latMax.push(nanoLat - within._lastLatMax);
 							within._lastLatMax = nanoLat;
 							continue;
 						}
@@ -330,11 +335,11 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 						searchMember.type.push(type);
 						searchMember.lonMin.push(nanoMinLon - searchMember._lastLonMin);
 						searchMember._lastLonMin = nanoMinLon;
-						searchMember.lanMin.push(nanoMinLat - searchMember._lastLatMin);
+						searchMember.latMin.push(nanoMinLat - searchMember._lastLatMin);
 						searchMember._lastLatMin = nanoMinLat;
 						searchMember.lonMax.push(nanoMaxLon - searchMember._lastLonMax);
 						searchMember._lastLonMax = nanoMaxLon;
-						searchMember.lanMax.push(nanoMaxLat - searchMember._lastLatMax);
+						searchMember.latMax.push(nanoMaxLat - searchMember._lastLatMax);
 						searchMember._lastLatMax = nanoMaxLat;
 					}
 					if(searchData.within._lastID == 0){
@@ -359,15 +364,22 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 						writeAndWait(tmpFileProtoBufs, searchBuf)
 					]);
 				}
+				if(allNonexistant){	
+					granularityLon = (
+						(Math.floor(granularityLon * granularityDivisor) + 1
+					) / granularityDivisor) - 1;
+				}
 				logProgressMsg(
 					"Index assembly part1 for 10**(" + exponent + "): " +
-						(uGranularityLon) + "/ 360" +
+						(uGranularityLon) + "/" + (maxLon * 2) +
 					" (" +
-					(uGranularityLon / 360 * 100).toFixed(2) +
+					(uGranularityLon / maxLon * 2 * 100).toFixed(2) +
 					"%)"
 				);
 			}
-			console.log("Index assembly part1 for 10**(" + exponent + "): 360/360 (100%)");
+			console.log(
+				"Index assembly part1 for 10**(" + exponent + "): " + (maxLon * 2) + "/" + (maxLon * 2) + " (100%)"
+			);
 		}
 	}catch(ex){
 		console.error(ex);
