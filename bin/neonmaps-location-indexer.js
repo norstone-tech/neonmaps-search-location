@@ -13,7 +13,7 @@ const {default: geoBBox} = require("@turf/bbox");
 const {default: geoBBoxPoly} = require("@turf/bbox-polygon");
 const {default: geoContains, doBBoxOverlap: geoBBoxContains} = require("@turf/boolean-contains");
 const {default: geoIntersects} = require("@turf/boolean-intersects");
-const {logProgressMsg} = require("../lib/util");
+const {logProgressMsg, multiPolyContainsPoly} = require("../lib/util");
 const {setTempFileDir, getTempFile, flushTempFiles} = require("../lib/indexer/tmpfiles");
 const {SearchSquare: SearchSquareParser} = require("../lib/proto-defs");
 const Pbf = require("pbf");
@@ -39,6 +39,7 @@ const options = program
 	)
 	.option("--tmpdir <dir>", "(debug) temp folder to use during indexing")
 	.option("--no-phase1", "(debug) skip phase 1")
+	.option("--no-phase2", "(debug) skip phase 2")
 	.parse()
 	.opts();
 const writeAndWait = function(
@@ -46,7 +47,7 @@ const writeAndWait = function(
 	/**@type {Buffer}*/ data
 ){
 	if(!stream.write(data)){
-		return new Promise(resolve => stream.on("drain", resolve));
+		return new Promise(resolve => stream.once("drain", resolve));
 	}
 }
 const mapPath = path.resolve(options.map);
@@ -89,13 +90,20 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 					const granularityLon = Math.floor(node.lon / granularityDivisor);
 					const granularityLat = Math.floor(node.lat / granularityDivisor);
 					const tmpData = await getTempFile(baseLon, baseLat, MIN_INDEX_GRANULARITY);
+					if(!tmpData.lon.every((v,i,a) => !i || a[i-1] <= v)){
+						debugger;
+					}
 					/**@type {number} */
 					const firstIndex = bounds.ge(tmpData.lon, granularityLon);
 					/**@type {number} */
 					const lastIndex = firstIndex >= tmpData.lon.length ? -1 : bounds.le(tmpData.lon, granularityLon);
 					let index = firstIndex;
-					if(firstIndex < tmpData.lon.length){
-						const latSubarray = tmpData.lat.slice(firstIndex, lastIndex);
+					// Note: I was dumb to think there would always be an LE, and that caused me much needless headache
+					if(lastIndex >= 0){
+						const latSubarray = tmpData.lat.slice(firstIndex, lastIndex + 1);
+						if(!latSubarray.every((v,i,a) => !i || a[i-1] <= v)){
+							debugger;
+						}
 						index += bounds.ge(latSubarray, granularityLat);
 					}
 					tmpData.id.splice(index, 0, node.id);
@@ -158,13 +166,19 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 							const baseLon = Math.floor(granularityLon * granularityDivisor);
 							const baseLat = Math.floor(granularityLat * granularityDivisor);
 							const tmpData = await getTempFile(baseLon, baseLat, exponent);
+							if(!tmpData.lon.every((v,i,a) => !i || a[i-1] <= v)){
+								debugger;
+							}
 							/**@type {number} */
 							const firstIndex = bounds.ge(tmpData.lon, granularityLon);
 							/**@type {number} */
 							const lastIndex = firstIndex >= tmpData.lon.length ? -1 : bounds.le(tmpData.lon, granularityLon);
 							let index = firstIndex;
-							if(firstIndex < tmpData.lon.length){
+							if(lastIndex >= 0){
 								const latSubarray = tmpData.lat.slice(firstIndex, lastIndex + 1);
+								if(!latSubarray.every((v,i,a) => !i || a[i-1] <= v)){
+									debugger;
+								}
 								index += bounds.ge(latSubarray, granularityLat);
 							}
 							tmpData.id.splice(index, 0, thing.id);
@@ -189,7 +203,11 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 			);
 			await flushTempFiles(0);
 		}
-		for(let exponent = MIN_INDEX_GRANULARITY; exponent <= MAX_INDEX_GRANULARITY; exponent += 1){
+		for(
+			let exponent = options.phase2 ? MIN_INDEX_GRANULARITY : Infinity;
+			exponent <= MAX_INDEX_GRANULARITY;
+			exponent += 1
+		){
 			const tmpFileOffsets = fs.createWriteStream(tmpDir + "/" + exponent + "_offsets");
 			const tmpFileProtoBufs = fs.createWriteStream(tmpDir + "/" + exponent + "_pbfs");
 			let currentOffset = 0;
@@ -319,7 +337,11 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 							searchData.within : (
 								geoIntersects(searchBBoxPoly, osmPoly) ?
 									searchData.intersected : (
-										geoContains(osmPoly, searchBBoxPoly) ? searchData.enveloped : null
+										(
+											osmPoly.geometry.type !== "LineString" &&
+											osmPoly.geometry.type !== "MultiLineString" &&
+											multiPolyContainsPoly(osmPoly, searchBBoxPoly)
+										) ? searchData.enveloped : null
 									)
 							);
 						if(searchMember == null){
@@ -373,7 +395,7 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 					"Index assembly part1 for 10**(" + exponent + "): " +
 						(uGranularityLon) + "/" + (maxLon * 2) +
 					" (" +
-					(uGranularityLon / maxLon * 2 * 100).toFixed(2) +
+					(uGranularityLon / maxLon / 2 * 100).toFixed(2) +
 					"%)"
 				);
 			}
