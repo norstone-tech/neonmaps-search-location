@@ -27,6 +27,12 @@ const SEARCH_TYPE_INVALID = -1;
 const SEARCH_TYPE_WITHIN = 0;
 const SEARCH_TYPE_INTERSECT = 1;
 const SEARCH_TYPE_ENVELOPED = 2;
+const OSMTYPE_NODE = 0;
+const OSMTYPE_WAY = 1;
+const OSMTYPE_RELATION = 2;
+const NANO_EXPONENT = 9;
+const NANO_DIVISOR = 10 ** 9;
+const SIZE_BBOX_RATIO = 5;
 
 const options = program
 .requiredOption("-m, --map <path>", "Map file, in .osm.pbf format")
@@ -48,7 +54,8 @@ const writeAndWait = function(
 }
 const mapPath = path.resolve(options.map);
 const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
-
+/**@type {Map<number, TempFileArray>} */
+const tmpFiles = new Map();
 (async () => {
 	const tmpDir = options.tmpdir ?
 		path.resolve(options.tmpdir) :
@@ -66,7 +73,13 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 			await offsetPromise;
 			segmentCount += 1;
 		}
+		for(let i = MIN_INDEX_GRANULARITY; i <= MAX_INDEX_GRANULARITY; i += 1){
+			const tmpFile = new TempFileArray(tmpDir, i);
+			tmpFiles.set(i, tmpFile);
+			await tmpFile.init();
+		}
 		for(mapDataPromise of mapReader.mapSegments()){
+			const tmpFile = tmpFiles.get(MIN_INDEX_GRANULARITY);
 			const mapData = await mapDataPromise;
 			if(!firstSegmentWithWay && mapData.ways.length){
 				firstSegmentWithWay = curentSegment;
@@ -79,13 +92,24 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 				if(options.ignoreTagless && node.tags.size == 0){
 					continue;
 				}
+				const lon = Math.round(node.lon * NANO_DIVISOR);
+				const lat = Math.round(node.lat * NANO_DIVISOR);
 				const granularityDivisor = 10 ** MIN_INDEX_GRANULARITY;
 				const granularityLon = Math.floor(node.lon / granularityDivisor);
 				const granularityLat = Math.floor(node.lat / granularityDivisor);
 				const uGranularityLon = granularityLon + (180 / granularityDivisor);
 				const uGranularityLat = granularityLat + (90 / granularityDivisor);
-				const searchNum = uGranularityLon * 10 ** (-(exponent + 2)) + uGranularityLat;
-				
+				const searchNum = uGranularityLon * 10 ** ((-MIN_INDEX_GRANULARITY) + 3) + uGranularityLat;
+				await tmpFile.push({
+					searchNum,
+					searchType: SEARCH_TYPE_WITHIN,
+					id: node.id,
+					type: OSMTYPE_NODE,
+					lonMin: lon,
+					latMin: lat,
+					lonMax: lon,
+					latMax: lat,
+				});
 			}
 			curentSegment += 1;
 			logProgressMsg(
@@ -114,6 +138,7 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 					await mapReader.getWayGeoJSON(thing) :
 					await mapReader.getRelationGeoJSON(thing);
 				const bbox = geoBBox(geometry);
+				const nanoBBox = bbox.map((v => Math.round(v * NANO_DIVISOR)));
 				// Math.abs is probably redundant here, but it's good to be safe
 				const bbSize = Math.max(Math.abs(bbox[0] - bbox[2]), Math.abs(bbox[1] - bbox[3]));
 				let exponent = Math.floor(Math.log10(bbSize * SIZE_BBOX_RATIO)) + 1;
@@ -122,6 +147,7 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 				}else if(exponent > MAX_INDEX_GRANULARITY){
 					exponent = MAX_INDEX_GRANULARITY;
 				}
+				const tmpFile = tmpFiles.get(exponent);
 				const granularityDivisor = 10 ** exponent;
 				const granularityMinLon = Math.floor(bbox[0] / granularityDivisor);
 				const granularityMinLat = Math.floor(bbox[1] / granularityDivisor);
@@ -141,29 +167,45 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 						granularityLat += 1
 					){
 						const uGranularityLat = granularityLat + (90 / granularityDivisor);
-						const firstLon = granularityLon * 10 ** (NANO_EXPONENT + exponent);
-						const firstLat = granularityLat * 10 ** (NANO_EXPONENT + exponent);
 						const searchBBoxPoly = geoBBoxPoly([
-							Number((firstLon / NANO_DIVISOR).toFixed(9)),
-							Number((firstLat / NANO_DIVISOR).toFixed(9)),
-							Number((((granularityLon + 1) * 10 ** (NANO_EXPONENT + exponent)) / NANO_DIVISOR).toFixed(9)),
-							Number((((granularityLat + 1) * 10 ** (NANO_EXPONENT + exponent)) / NANO_DIVISOR).toFixed(9))
+							Number((
+								(granularityLon * 10 ** (NANO_EXPONENT + exponent)) / NANO_DIVISOR
+							).toFixed(9)),
+							Number((
+								(granularityLat * 10 ** (NANO_EXPONENT + exponent)) / NANO_DIVISOR
+							).toFixed(9)),
+							Number((
+								((granularityLon + 1) * 10 ** (NANO_EXPONENT + exponent)) / NANO_DIVISOR
+							).toFixed(9)),
+							Number((
+								((granularityLat + 1) * 10 ** (NANO_EXPONENT + exponent)) / NANO_DIVISOR
+							).toFixed(9))
 						]);
-						const searchType = geoBBoxContains(searchBBoxPoly.bbox, osmPoly.bbox) ?
+						const searchType = geoBBoxContains(searchBBoxPoly.bbox, bbox) ?
 							SEARCH_TYPE_WITHIN : (
-								geoIntersects(searchBBoxPoly, osmPoly) ?
+								geoIntersects(searchBBoxPoly, geometry) ?
 									SEARCH_TYPE_INTERSECT : (
 										(
-											osmPoly.geometry.type !== "LineString" &&
-											osmPoly.geometry.type !== "MultiLineString" &&
-											multiPolyContainsPoly(osmPoly, searchBBoxPoly)
+											geometry.geometry.type !== "LineString" &&
+											geometry.geometry.type !== "MultiLineString" &&
+											multiPolyContainsPoly(geometry, searchBBoxPoly)
 										) ? SEARCH_TYPE_ENVELOPED : SEARCH_TYPE_INVALID
 									)
 							);
 						if(searchType == SEARCH_TYPE_INVALID){
 							continue;
 						}
-						const searchNum = uGranularityLon * 10 ** (-(exponent + 2)) + uGranularityLat;
+						const searchNum = uGranularityLon * 10 ** ((-exponent) + 3) + uGranularityLat;
+						await tmpFile.push({
+							searchNum,
+							searchType: SEARCH_TYPE_WITHIN,
+							id: thing.id,
+							type: thing.type == "way" ? OSMTYPE_WAY : OSMTYPE_RELATION,
+							lonMin: nanoBBox[0],
+							latMin: nanoBBox[1],
+							lonMax: nanoBBox[2],
+							latMax: nanoBBox[3],
+						});
 					}
 				}
 			}
@@ -180,6 +222,9 @@ const mapReader = new MapReader(mapPath, 5, 5, 0, 10, 5, true, false);
 			(segmentCount - firstSegmentWithWay) + "/" + (segmentCount - firstSegmentWithWay) +
 			" (100%)"
 		);
+		console.log("Index sorting: ?/? (0%)");
+		await Promise.all([...tmpFiles.values()].map(tmpFile => tmpFile.sort()));
+		console.log("Index sorting: ?/? (100%)");
 	}catch(ex){
 		console.error(ex);
 		process.exitCode = 1;
