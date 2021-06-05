@@ -393,4 +393,7 @@ const tmpFiles = new Map();
 		console.error(ex);
 		process.exitCode = 1;
 	}
+	if(!options.tmpdir){
+		await fsp.rm(tmpDir, {force: true, recursive: true});
+	}
 })();
