@@ -5,7 +5,7 @@ message SearchSquareMember {
 		WAY = 1;
 		RELATION = 2;
 	}
-	repeated uint64 id = 1 [packed = true]; // DELTA coded
+	repeated sint64 id = 1 [packed = true]; // DELTA coded
 	repeated MemberType type = 2 [packed = true];
 	repeated sint64 lonMin = 3 [packed = true]; // nanodegrees DELTA coded (Starting at square)
 	repeated sint64 latMin = 4 [packed = true]; // nanodegrees DELTA coded (Starting at square)

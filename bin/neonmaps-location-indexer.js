@@ -14,13 +14,15 @@ const {default: geoBBox} = require("@turf/bbox");
 const {default: geoBBoxPoly} = require("@turf/bbox-polygon");
 const {default: geoContains, doBBoxOverlap: geoBBoxContains} = require("@turf/boolean-contains");
 const {default: geoIntersects} = require("@turf/boolean-intersects");
-const {logProgressMsg, multiPolyContainsPoly} = require("../lib/util");
+const {logProgressMsg, multiPolyContainsPoly, searchNumSizeFromExponent} = require("../lib/util");
 const {SearchSquare: SearchSquareParser} = require("../lib/proto-defs");
 const Pbf = require("pbf");
 
 /**@typedef {import("neonmaps-base/lib/map-reader-base").OSMDecodeResult} OSMDecodeResult */
 /**@typedef {import("../lib/proto-defs").ProtoSearchSquare} ProtoSearchSquare */
 /**@typedef {import("../lib/proto-defs").ProtoSearchSquareMember} ProtoSearchSquareMember */
+const INT24_SIZE = 3;
+const INT48_SIZE = 6;
 const MIN_INDEX_GRANULARITY = -2;
 const MAX_INDEX_GRANULARITY = 1;
 const SEARCH_TYPE_INVALID = -1;
@@ -33,6 +35,8 @@ const OSMTYPE_RELATION = 2;
 const NANO_EXPONENT = 9;
 const NANO_DIVISOR = 10 ** 9;
 const SIZE_BBOX_RATIO = 5;
+const FILE_MAGIC_NUMBER = "neonmaps.location_index\0";
+const FILE_CHECKSUM_LENGTH = 64;
 
 const options = program
 	.requiredOption("-m, --map <path>", "Map file, in .osm.pbf format")
@@ -42,6 +46,7 @@ const options = program
 	)
 	.option("--tmpdir <dir>", "(debug) temp folder to use during indexing")
 	.option("--no-phase1", "(debug) skip phase 1")
+	.option("--no-phase2", "(debug) skip phase 2")
 	.parse()
 	.opts();
 
@@ -63,7 +68,12 @@ const tmpFiles = new Map();
 		await fsp.mkdtemp(path.join(os.tmpdir(), "neonmaps-location-"));
 	try{
 		await mapReader.init();
-			if(options.phase1){
+		for(let i = MIN_INDEX_GRANULARITY; i <= MAX_INDEX_GRANULARITY; i += 1){
+			const tmpFile = new TempFileArray(tmpDir, i);
+			tmpFiles.set(i, tmpFile);
+			await tmpFile.init();
+		}
+		if(options.phase1){
 			/**@type {Promise<number>} */
 			let offsetPromise;
 			/**@type {Promise<OSMDecodeResult>} */
@@ -75,11 +85,7 @@ const tmpFiles = new Map();
 				await offsetPromise;
 				segmentCount += 1;
 			}
-			for(let i = MIN_INDEX_GRANULARITY; i <= MAX_INDEX_GRANULARITY; i += 1){
-				const tmpFile = new TempFileArray(tmpDir, i);
-				tmpFiles.set(i, tmpFile);
-				await tmpFile.init();
-			}
+
 			for(mapDataPromise of mapReader.mapSegments()){
 				const tmpFile = tmpFiles.get(MIN_INDEX_GRANULARITY);
 				const mapData = await mapDataPromise;
@@ -228,6 +234,161 @@ const tmpFiles = new Map();
 			await Promise.all([...tmpFiles.values()].map(tmpFile => tmpFile.sort()));
 			console.log("Index sorting: ?/? (100%)");
 		}
+		if(options.phase2){
+			const pbfStream = fs.createWriteStream(tmpDir + path.sep + "pbfs");
+			let pbfOffset = 0;
+			for(let i = MIN_INDEX_GRANULARITY; i <= MAX_INDEX_GRANULARITY; i += 1){
+				const searchNumSize = searchNumSizeFromExponent(i);
+				const tmpFile = tmpFiles.get(i);
+				const indexStream = fs.createWriteStream(tmpDir + path.sep + i + "_index");
+				let searchNum = -1;
+				const searchDataArr = [];
+				for(let ii = 0; ii < tmpFile.length; ii += 1){
+					const tmpData = await tmpFile.get(ii);
+					if(tmpData.searchNum != searchNum){
+						const gDivisor = 10 ** ((-i) + 3);
+						const uGranularityLon = Math.floor(searchNum / gDivisor);
+						const uGranularityLat = searchNum % (uGranularityLon * gDivisor);
+
+						let lastID = 0;
+						let lastSearchType = -1;
+						let lastLonMin = 0;
+						let lastLatMin = 0;
+						let lastLonMax = 0;
+						let lastLatMax = 0;
+						searchDataArr.sort((a, b) => {
+							const searchDiff = a.searchType - b.searchType;
+							if(searchDiff != 0){
+								return searchDiff;
+							}
+							return a.lonMin - b.lonMin;
+						});
+						const searchSquare = {
+							within: {
+								id: [],
+								type: [],
+								lonMin: [],
+								latMin: [],
+								lonMax: [],
+								latMax: []
+							},
+							intersected: {
+								id: [],
+								type: [],
+								lonMin: [],
+								latMin: [],
+								lonMax: [],
+								latMax: []
+							},
+							enveloped: {
+								id: [],
+								type: [],
+								lonMin: [],
+								latMin: [],
+								lonMax: [],
+								latMax: []
+							}
+						}
+						for(let iii = 0; iii < searchDataArr.length; iii += 1){
+							const searchData = searchDataArr[iii];
+							if(searchData.searchType != lastSearchType){
+								lastSearchType = searchData.searchType;
+								lastID = 0;
+								lastLonMin = (uGranularityLon - (180 * 10 ** (-i))) * 10 ** (NANO_EXPONENT + i);
+								lastLatMin = (uGranularityLat - (90 * 10 ** (-i))) * 10 ** (NANO_EXPONENT + i);
+								lastLonMax = lastLonMin;
+								lastLatMax = lastLatMin;
+							}
+							let searchMember;
+							switch(lastSearchType){
+								case SEARCH_TYPE_WITHIN:
+									searchMember = searchSquare.within;
+									break;
+								case SEARCH_TYPE_INTERSECT:
+									searchMember = searchSquare.intersected;
+									break;
+								case SEARCH_TYPE_ENVELOPED:
+									searchMember = searchSquare.enveloped;
+									break;
+								default:
+									throw new Error("This shouldn't happen");
+							}
+							searchMember.id.push(searchData.id - lastID);
+							lastID = searchData.id;
+							searchMember.type.push(searchData.type);
+							searchMember.lonMin.push(searchData.lonMin - lastLonMin);
+							lastLonMin = searchData.lonMin;
+							searchMember.latMin.push(searchData.latMin - lastLatMin)
+							lastLatMin = searchData.latMin;
+							searchMember.lonMax.push(searchData.lonMax - lastLonMax);
+							lastLonMax = searchData.lonMax;
+							searchMember.latMax.push(searchData.latMax - lastLatMax)
+							lastLatMax = searchData.latMax;
+						}
+						if(!searchSquare.within.id.length){
+							delete searchSquare.within;
+						}
+						if(!searchSquare.intersected.id.length){
+							delete searchSquare.intersected;
+						}
+						if(!searchSquare.enveloped.id.length){
+							delete searchSquare.enveloped;
+						}
+						const pbf = new Pbf();
+						SearchSquareParser.write(searchSquare, pbf);
+						const pbfBuf = pbf.finish();
+						if(pbfBuf.length){
+							const indexBuf = Buffer.allocUnsafe(searchNumSize + INT48_SIZE + INT24_SIZE);
+							indexBuf.writeUIntLE(searchNum, 0, searchNumSize);
+							indexBuf.writeUIntLE(pbfOffset, searchNumSize, INT48_SIZE);
+							indexBuf.writeUIntLE(pbfBuf.length, searchNumSize + INT48_SIZE, INT24_SIZE);
+							await Promise.all([
+								writeAndWait(indexStream, indexBuf),
+								writeAndWait(pbfStream, pbfBuf)
+							]);
+						}
+						searchNum = tmpData.searchNum;
+						searchDataArr.length = 0;
+					}
+					searchDataArr.push(tmpData);
+					logProgressMsg(
+						"Index compression for " + i + ": " + ii + "/" + tmpFile.length + " (" +
+							(ii / tmpFile.length * 100).toFixed(2) +
+						"%)"
+					);
+				}
+				console.log("Index compression for " + i + ": " + tmpFile.length + "/" + tmpFile.length + " (100%)");
+			}
+		}
+		const indexOffsets = new Map([[
+			MIN_INDEX_GRANULARITY,
+			FILE_MAGIC_NUMBER.length + FILE_CHECKSUM_LENGTH + 3 +
+				(MAX_INDEX_GRANULARITY - MIN_INDEX_GRANULARITY + 2) * INT48_SIZE
+		]]);
+		for(let i = MIN_INDEX_GRANULARITY; i <= MAX_INDEX_GRANULARITY; i += 1){
+			indexOffsets.set(
+				i + 1,
+				(await fsp.stat(tmpDir + path.sep + i + "_index")).size + indexOffsets.get(i)
+			);
+		}
+		const mapName = mapPath.substring(mapPath.lastIndexOf(path.sep) + 1, mapPath.length - ".osm.pbf".length);
+		const indexFileStream = fs.createWriteStream(path.resolve(mapPath, "..", mapName + ".neonmaps.location_index"));
+		indexFileStream.write(FILE_MAGIC_NUMBER);
+		indexFileStream.write(await mapReader.checksum);
+		indexFileStream.write(Buffer.from([MIN_INDEX_GRANULARITY + 256, MAX_INDEX_GRANULARITY, SIZE_BBOX_RATIO]));
+		for(let i = MIN_INDEX_GRANULARITY; i <= (MAX_INDEX_GRANULARITY + 1); i += 1){
+			const offsetBuf = Buffer.allocUnsafe(INT48_SIZE);
+			offsetBuf.writeUIntLE(indexOffsets.get(i), 0, INT48_SIZE);
+			indexFileStream.write(offsetBuf);
+		}
+		for(let i = MIN_INDEX_GRANULARITY; i <= MAX_INDEX_GRANULARITY; i += 1){
+			const copyFromBuf = fs.createReadStream(tmpDir + path.sep + i + "_index");
+			copyFromBuf.pipe(indexFileStream, {end: false});
+			await new Promise(resolve => copyFromBuf.once("close", resolve));
+		}
+		const copyFromBuf = fs.createReadStream(tmpDir + path.sep + "pbfs");
+		copyFromBuf.pipe(indexFileStream);
+		await new Promise(resolve => copyFromBuf.once("close", resolve));
 	}catch(ex){
 		console.error(ex);
 		process.exitCode = 1;
