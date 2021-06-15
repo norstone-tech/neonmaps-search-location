@@ -9,7 +9,6 @@ const {promises: fsp} = require("fs");
 const {program} = require("commander");
 const {MapReader} = require("neonmaps-base");
 const {TempFileArray} = require("../lib/indexer/tempfile-array");
-const bounds = require("binary-search-bounds");
 const {default: geoBBox} = require("@turf/bbox");
 const {default: geoBBoxPoly} = require("@turf/bbox-polygon");
 const {default: geoContains, doBBoxOverlap: geoBBoxContains} = require("@turf/boolean-contains");
